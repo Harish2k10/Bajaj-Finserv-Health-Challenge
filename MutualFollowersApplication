@@ -1,0 +1,160 @@
+import org.springframework.boot.SpringApplication;
+import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
+import org.springframework.http.*;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.retry.annotation.Backoff;
+import org.springframework.retry.annotation.Retryable;
+import org.springframework.retry.support.RetryTemplate;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
+
+import java.util.*;
+
+@SpringBootApplication
+public class MutualFollowersApplication {
+
+    public static void main(String[] args) {
+        SpringApplication.run(MutualFollowersApplication.class, args);
+    }
+
+    @Autowired
+    private WebhookService webhookService;
+
+    @EventListener(ApplicationReadyEvent.class)
+    public void onStartup() {
+        webhookService.process();
+    }
+}
+
+@Component
+class WebhookService {
+    private static final String INITIAL_URL = "https://bfhldevapigv.healthrx.co.in/hiring/generateWebhook";
+    private final RestTemplate restTemplate;
+    private final RetryTemplate retryTemplate;
+
+    public WebhookService(RestTemplate restTemplate, RetryTemplate retryTemplate) {
+        this.restTemplate = restTemplate;
+        this.retryTemplate = retryTemplate;
+    }
+
+    public void process() {
+        // Step 1: Make initial request to generate webhook
+        GenerateWebhookRequest request = new GenerateWebhookRequest(
+                "John Doe", "REG12347", "john@example.com");
+        
+        ResponseEntity<WebhookResponse> response = restTemplate.postForEntity(
+                INITIAL_URL, 
+                request, 
+                WebhookResponse.class);
+        
+        if (response.getStatusCode() == HttpStatus.OK && response.getBody() != null) {
+            WebhookResponse webhookResponse = response.getBody();
+            
+            // Step 2: Process the data to find mutual followers
+            List<List<Integer>> mutualFollowers = findMutualFollowers(webhookResponse.getData().getUsers());
+            
+            // Step 3: Prepare and send the result to webhook with retry
+            Outcome outcome = new Outcome("REG12347", mutualFollowers);
+            sendToWebhookWithRetry(webhookResponse.getWebhook(), 
+                                 webhookResponse.getAccessToken(), 
+                                 outcome);
+        }
+    }
+
+    private List<List<Integer>> findMutualFollowers(List<User> users) {
+        List<List<Integer>> result = new ArrayList<>();
+        Map<Integer, Set<Integer>> followsMap = new HashMap<>();
+        
+        // Build follow relationship map
+        for (User user : users) {
+            followsMap.put(user.getId(), new HashSet<>(user.getFollows()));
+        }
+        
+        // Check for mutual follows
+        for (User user : users) {
+            int userId = user.getId();
+            for (int followedId : user.getFollows()) {
+                if (followsMap.containsKey(followedId) && 
+                    followsMap.get(followedId).contains(userId) &&
+                    userId < followedId) { // Ensure we only add each pair once
+                    result.add(Arrays.asList(userId, followedId));
+                }
+            }
+        }
+        
+        // Sort the result by the first element in each pair
+        result.sort(Comparator.comparingInt(pair -> pair.get(0)));
+        return result;
+    }
+
+    @Retryable(maxAttempts = 4, backoff = @Backoff(delay = 1000))
+    private void sendToWebhookWithRetry(String webhookUrl, String token, Outcome outcome) {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setContentType(MediaType.APPLICATION_JSON);
+        headers.set("Authorization", token);
+        
+        HttpEntity<Outcome> request = new HttpEntity<>(outcome, headers);
+        
+        ResponseEntity<String> response = restTemplate.postForEntity(
+                webhookUrl, 
+                request, 
+                String.class);
+        
+        if (!response.getStatusCode().is2xxSuccessful()) {
+            throw new RuntimeException("Webhook call failed, will retry");
+        }
+    }
+}
+
+// DTO classes
+class GenerateWebhookRequest {
+    private String name;
+    private String regNo;
+    private String email;
+
+    // Constructor, getters, setters
+    public GenerateWebhookRequest(String name, String regNo, String email) {
+        this.name = name;
+        this.regNo = regNo;
+        this.email = email;
+    }
+
+    // Getters and setters...
+}
+
+class WebhookResponse {
+    private String webhook;
+    private String accessToken;
+    private UserData data;
+
+    // Getters and setters...
+}
+
+class UserData {
+    private List<User> users;
+
+    // Getters and setters...
+}
+
+class User {
+    private int id;
+    private String name;
+    private List<Integer> follows;
+
+    // Getters and setters...
+}
+
+class Outcome {
+    private String regNo;
+    private List<List<Integer>> outcome;
+
+    // Constructor, getters, setters
+    public Outcome(String regNo, List<List<Integer>> outcome) {
+        this.regNo = regNo;
+        this.outcome = outcome;
+    }
+
+    // Getters and setters...
+}
